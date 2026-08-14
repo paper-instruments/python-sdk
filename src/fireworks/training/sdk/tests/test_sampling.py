@@ -289,7 +289,9 @@ class TestTransportLevel:
 
         class _CoalescedStream(httpx.AsyncByteStream):
             async def __aiter__(self):
-                yield payload
+                split = payload.index(b"\n\n") - 1
+                yield payload[:split]
+                yield payload[split:]
 
             async def aclose(self) -> None:
                 pass
