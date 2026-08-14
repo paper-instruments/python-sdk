@@ -264,49 +264,38 @@ def _sse_success_bytes() -> bytes:
 
 
 class TestTransportLevel:
-    def test_coalesced_stream_preserves_output_and_yields_to_event_loop(self):
-        event_count = 256
-        logprobs_per_event = 64
+    def test_coalesced_stream_preserves_output_and_yields_between_events(self, monkeypatch):
         logprob = {"token": "x", "logprob": -0.1, "sampling_logprob": -0.2}
-        events = []
-        for index in range(event_count):
-            choice = {
-                "text": "x",
-                "logprobs": {"content": [logprob] * logprobs_per_event},
-            }
-            if index == event_count - 1:
-                choice.update(
-                    finish_reason="stop",
-                    raw_output={
-                        "completion_token_ids": list(range(event_count)),
+        first = {"choices": [{"text": "a", "logprobs": {"content": [logprob]}}]}
+        second = {
+            "choices": [
+                {
+                    "text": "b",
+                    "logprobs": {"content": [logprob]},
+                    "finish_reason": "stop",
+                    "raw_output": {
+                        "completion_token_ids": [10, 20],
                         "routing_matrices": ["route"],
                     },
-                )
-            events.append(
-                "data: "
-                + json.dumps(
-                    {
-                        "choices": [choice],
-                        "perf_metrics": {"prefill-queue-duration": "0.1"},
-                    }
-                )
-                + "\n\n"
-            )
-        payload = ("".join(events) + "data: [DONE]\n\n").encode()
+                }
+            ],
+            "perf_metrics": {"prefill-queue-duration": "0.1"},
+        }
+        payload = (
+            f"data: {json.dumps(first)}\n\n"
+            f"data: {json.dumps(second)}\n\n"
+            "data: [DONE]\n\n"
+        ).encode()
 
         class _CoalescedStream(httpx.AsyncByteStream):
-            def __init__(self) -> None:
-                self.started = asyncio.Event()
-
             async def __aiter__(self):
-                self.started.set()
-                for start in range(0, len(payload), 64 * 1024):
-                    yield payload[start : start + 64 * 1024]
+                yield payload
 
             async def aclose(self) -> None:
                 pass
 
         async def run():
+            loop = asyncio.get_running_loop()
             stream = _CoalescedStream()
             request = httpx.Request("POST", _URL)
             response = httpx.Response(200, request=request, stream=stream)
@@ -317,32 +306,51 @@ class TestTransportLevel:
 
             sampler = _make_sampler()
             sampler._get_async_client = lambda: _Client()
-            sampling_finished = False
-            heartbeat_ticks = 0
+            loads = json.loads
+            sleep = asyncio.sleep
+            decode_count = 0
+            cooperative_yields = 0
+            marker_ran = False
+            marker_ran_before_second_decode = False
 
-            async def heartbeat():
-                nonlocal heartbeat_ticks
-                await stream.started.wait()
-                while not sampling_finished:
-                    heartbeat_ticks += 1
-                    await asyncio.sleep(0)
+            def mark_scheduled() -> None:
+                nonlocal marker_ran
+                marker_ran = True
 
-            heartbeat_task = asyncio.create_task(heartbeat())
+            def controlled_loads(value):
+                nonlocal decode_count, marker_ran_before_second_decode
+                decode_count += 1
+                if decode_count == 1:
+                    loop.call_soon(mark_scheduled)
+                    deadline = loop.time() + 0.002
+                    while loop.time() < deadline:
+                        pass
+                elif decode_count == 2:
+                    marker_ran_before_second_decode = marker_ran
+                return loads(value)
+
+            async def counted_sleep(delay):
+                nonlocal cooperative_yields
+                if delay == 0:
+                    cooperative_yields += 1
+                await sleep(delay)
+
+            monkeypatch.setattr("fireworks.training.sdk.sampling.json.loads", controlled_loads)
+            monkeypatch.setattr("fireworks.training.sdk.sampling.asyncio.sleep", counted_sleep)
             result, metrics = await sampler.async_completions_stream(prompt=[1, 2, 3])
-            sampling_finished = True
-            await heartbeat_task
             await response.aclose()
             sampler.close()
-            return result, metrics, heartbeat_ticks
+            return result, metrics, marker_ran_before_second_decode, cooperative_yields
 
-        result, metrics, heartbeat_ticks = asyncio.run(run())
+        result, metrics, marker_ran_before_second_decode, cooperative_yields = asyncio.run(run())
         choice = result["choices"][0]
 
-        assert heartbeat_ticks > 0
-        assert choice["text"] == "x" * event_count
-        assert choice["logprobs"]["content"] == [logprob] * (event_count * logprobs_per_event)
+        assert marker_ran_before_second_decode
+        assert cooperative_yields == 1
+        assert choice["text"] == "ab"
+        assert choice["logprobs"]["content"] == [logprob, logprob]
         assert choice["raw_output"] == {
-            "completion_token_ids": list(range(event_count)),
+            "completion_token_ids": [10, 20],
             "routing_matrices": ["route"],
         }
         assert metrics.prefill_queue_duration == pytest.approx(0.1)

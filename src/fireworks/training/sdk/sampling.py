@@ -327,6 +327,10 @@ class DeploymentSampler(_RestClient):
                 try:
                     chunk = json.loads(sse.data)
                 except (ValueError, TypeError):
+                    processing_since_cooperative_yield += loop.time() - event_processing_started
+                    if processing_since_cooperative_yield >= _COOPERATIVE_EVENT_PROCESSING_BUDGET_SECONDS:
+                        await asyncio.sleep(0)
+                        processing_since_cooperative_yield = 0.0
                     continue
 
                 for choice in chunk.get("choices", []):
