@@ -8,6 +8,7 @@ recorded attempt or exception.
 
 from __future__ import annotations
 
+import json
 import uuid
 import asyncio
 
@@ -263,6 +264,89 @@ def _sse_success_bytes() -> bytes:
 
 
 class TestTransportLevel:
+    def test_coalesced_stream_preserves_output_and_yields_to_event_loop(self):
+        event_count = 256
+        logprobs_per_event = 64
+        logprob = {"token": "x", "logprob": -0.1, "sampling_logprob": -0.2}
+        events = []
+        for index in range(event_count):
+            choice = {
+                "text": "x",
+                "logprobs": {"content": [logprob] * logprobs_per_event},
+            }
+            if index == event_count - 1:
+                choice.update(
+                    finish_reason="stop",
+                    raw_output={
+                        "completion_token_ids": list(range(event_count)),
+                        "routing_matrices": ["route"],
+                    },
+                )
+            events.append(
+                "data: "
+                + json.dumps(
+                    {
+                        "choices": [choice],
+                        "perf_metrics": {"prefill-queue-duration": "0.1"},
+                    }
+                )
+                + "\n\n"
+            )
+        payload = ("".join(events) + "data: [DONE]\n\n").encode()
+
+        class _CoalescedStream(httpx.AsyncByteStream):
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+
+            async def __aiter__(self):
+                self.started.set()
+                for start in range(0, len(payload), 64 * 1024):
+                    yield payload[start : start + 64 * 1024]
+
+            async def aclose(self) -> None:
+                pass
+
+        async def run():
+            stream = _CoalescedStream()
+            request = httpx.Request("POST", _URL)
+            response = httpx.Response(200, request=request, stream=stream)
+
+            class _Client:
+                async def post(self, *_args, **_kwargs):
+                    return response
+
+            sampler = _make_sampler()
+            sampler._get_async_client = lambda: _Client()
+            sampling_finished = False
+            heartbeat_ticks = 0
+
+            async def heartbeat():
+                nonlocal heartbeat_ticks
+                await stream.started.wait()
+                while not sampling_finished:
+                    heartbeat_ticks += 1
+                    await asyncio.sleep(0)
+
+            heartbeat_task = asyncio.create_task(heartbeat())
+            result, metrics = await sampler.async_completions_stream(prompt=[1, 2, 3])
+            sampling_finished = True
+            await heartbeat_task
+            await response.aclose()
+            sampler.close()
+            return result, metrics, heartbeat_ticks
+
+        result, metrics, heartbeat_ticks = asyncio.run(run())
+        choice = result["choices"][0]
+
+        assert heartbeat_ticks > 0
+        assert choice["text"] == "x" * event_count
+        assert choice["logprobs"]["content"] == [logprob] * (event_count * logprobs_per_event)
+        assert choice["raw_output"] == {
+            "completion_token_ids": list(range(event_count)),
+            "routing_matrices": ["route"],
+        }
+        assert metrics.prefill_queue_duration == pytest.approx(0.1)
+
     def test_x_request_id_header_sent(self):
         seen: dict = {}
 

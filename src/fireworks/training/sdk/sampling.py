@@ -45,6 +45,8 @@ from fireworks.training.sdk.sampling_observability import (
 
 logger = logging.getLogger(__name__)
 
+_COOPERATIVE_EVENT_PROCESSING_BUDGET_SECONDS = 0.001
+
 # =============================================================================
 # DeploymentSampler — completions API with client-side tokenization
 # =============================================================================
@@ -314,11 +316,14 @@ class DeploymentSampler(_RestClient):
             has_seen_finish_reason = False
 
             decoder = _SSEDecoder()
+            loop = asyncio.get_running_loop()
+            processing_since_cooperative_yield = 0.0
             async for sse in decoder.aiter_events(resp):
                 if sse.data.startswith("[DONE]"):
                     has_seen_done = True
                     break
 
+                event_processing_started = loop.time()
                 try:
                     chunk = json.loads(sse.data)
                 except (ValueError, TypeError):
@@ -353,6 +358,11 @@ class DeploymentSampler(_RestClient):
                 # (with is_completed=True, so it has full timing data).
                 if "perf_metrics" in chunk:
                     perf_metrics_dict = chunk["perf_metrics"]
+
+                processing_since_cooperative_yield += loop.time() - event_processing_started
+                if processing_since_cooperative_yield >= _COOPERATIVE_EVENT_PROCESSING_BUDGET_SECONDS:
+                    await asyncio.sleep(0)
+                    processing_since_cooperative_yield = 0.0
 
             if not raw_output and not has_seen_done and not has_seen_finish_reason:
                 raise _SSETruncationError(
