@@ -61,6 +61,7 @@ from fireworks.training.sdk.deployment import (
     DeploymentConfig,
     DeploymentManager,
     DeploymentSampler,
+    SampledCompletion,
 )
 from fireworks.training.sdk.concurrency import SamplingConcurrencyController
 from fireworks.training.sdk._snapshot_chain import (
@@ -393,6 +394,31 @@ class FiretitanSamplingClient(SamplingClient):
                 sampling_params,
                 include_prompt_logprobs,
                 topk_prompt_logprobs,
+            )
+        )
+
+    async def sample_with_prompt_tokens(
+        self,
+        prompt_token_ids: list[int],
+        n: int = 1,
+        max_tokens: int = 1024,
+        temperature: float = 1.0,
+        max_seq_len: int | None = None,
+        stop: list[str] | list[int] | None = None,
+        **kwargs: Any,
+    ) -> list[SampledCompletion]:
+        """Sample n native completions on the managed sampling loop."""
+        return await self._await_concurrent_future(
+            self._submit(
+                self.deployment_sampler.sample_with_prompt_tokens(
+                    prompt_token_ids,
+                    n=n,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    max_seq_len=max_seq_len,
+                    stop=stop,
+                    **kwargs,
+                )
             )
         )
 

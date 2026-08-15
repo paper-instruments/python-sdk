@@ -6,6 +6,7 @@ import sys
 import types as pytypes
 import asyncio
 import logging
+import threading
 from dataclasses import replace
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock
@@ -26,6 +27,7 @@ from fireworks.training.sdk.deployment import (
     DeploymentConfig,
     DeploymentManager,
     DeploymentSampler,
+    SampledCompletion,
     FixedConcurrencyController,
     AdaptiveConcurrencyController,
     DeploymentSamplerTimeoutError,
@@ -1670,6 +1672,102 @@ class TestFiretitanSamplingClient:
         try:
             assert issubclass(FiretitanSamplingClient, tinker.SamplingClient)
             assert isinstance(client, tinker.SamplingClient)
+        finally:
+            client.close()
+
+    def test_native_sampling_runs_on_managed_loop_without_conversion(self):
+        sampler = _make_sampler(tokenizer=None)
+        completion = SampledCompletion(
+            text="done",
+            full_tokens=[10, 20, 30],
+            prompt_len=2,
+            completion_len=1,
+        )
+        marker = object()
+        captured = {}
+
+        async def _sample(*args, **kwargs):
+            captured["thread_name"] = threading.current_thread().name
+            captured["loop"] = asyncio.get_running_loop()
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return [completion]
+
+        sampler.sample_with_prompt_tokens = _sample
+        client = FiretitanSamplingClient(sampler)
+
+        async def _run():
+            return await client.sample_with_prompt_tokens(
+                [10, 20],
+                n=3,
+                max_tokens=512,
+                temperature=0.7,
+                max_seq_len=4096,
+                stop=[99],
+                logprobs=True,
+                request_marker=marker,
+            )
+
+        try:
+            result = asyncio.run(_run())
+            assert captured["thread_name"] == "fireworks-sampling-client"
+            assert captured["loop"] is client._loop
+            assert captured["args"] == ([10, 20],)
+            assert captured["kwargs"] == {
+                "n": 3,
+                "max_tokens": 512,
+                "temperature": 0.7,
+                "max_seq_len": 4096,
+                "stop": [99],
+                "logprobs": True,
+                "request_marker": marker,
+            }
+            assert result == [completion]
+            assert result[0] is completion
+        finally:
+            client.close()
+
+    def test_native_sampling_cancellation_preserves_client_reuse(self):
+        sampler = _make_sampler(tokenizer=None)
+        started = threading.Event()
+        cancelled = threading.Event()
+        completion = SampledCompletion(
+            text="done",
+            full_tokens=[1, 2],
+            prompt_len=1,
+            completion_len=1,
+        )
+        calls = 0
+
+        async def _sample(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            return [completion]
+
+        sampler.sample_with_prompt_tokens = _sample
+        client = FiretitanSamplingClient(sampler)
+
+        async def _run():
+            task = asyncio.create_task(client.sample_with_prompt_tokens([1]))
+            assert await asyncio.to_thread(started.wait, 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert await asyncio.to_thread(cancelled.wait, 2)
+
+            result = await client.sample_with_prompt_tokens([1])
+            assert result[0] is completion
+
+        try:
+            asyncio.run(_run())
+            assert calls == 2
         finally:
             client.close()
 
