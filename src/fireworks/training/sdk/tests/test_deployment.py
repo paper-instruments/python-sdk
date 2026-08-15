@@ -7,6 +7,7 @@ import types as pytypes
 import asyncio
 import logging
 import threading
+from contextvars import ContextVar
 from dataclasses import replace
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock
@@ -1684,11 +1685,14 @@ class TestFiretitanSamplingClient:
             completion_len=1,
         )
         marker = object()
+        request_context = ContextVar("request_context")
+        request_context.set(marker)
         captured = {}
 
         async def _sample(*args, **kwargs):
             captured["thread_name"] = threading.current_thread().name
             captured["loop"] = asyncio.get_running_loop()
+            captured["context"] = request_context.get()
             captured["args"] = args
             captured["kwargs"] = kwargs
             return [completion]
@@ -1712,6 +1716,7 @@ class TestFiretitanSamplingClient:
             result = asyncio.run(_run())
             assert captured["thread_name"] == "fireworks-sampling-client"
             assert captured["loop"] is client._loop
+            assert captured["context"] is marker
             assert captured["args"] == ([10, 20],)
             assert captured["kwargs"] == {
                 "n": 3,
