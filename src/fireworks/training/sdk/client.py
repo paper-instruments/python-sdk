@@ -144,7 +144,7 @@ class FiretitanSamplingClient(SamplingClient):
         self.deployment_sampler = deployment_sampler
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
-        self._loop_lock = threading.Lock()
+        self._loop_lock = threading.RLock()
         self._closed = False
 
     @classmethod
@@ -176,10 +176,9 @@ class FiretitanSamplingClient(SamplingClient):
         return types
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
-        if self._closed:
-            raise RuntimeError("FiretitanSamplingClient is closed")
-
         with self._loop_lock:
+            if self._closed:
+                raise RuntimeError("FiretitanSamplingClient is closed")
             if self._loop is not None and self._loop_thread is not None and self._loop_thread.is_alive():
                 return self._loop
 
@@ -188,8 +187,12 @@ class FiretitanSamplingClient(SamplingClient):
 
             def _run_loop() -> None:
                 asyncio.set_event_loop(loop)
-                started.set()
-                loop.run_forever()
+                loop.call_soon(started.set)
+                try:
+                    loop.run_forever()
+                finally:
+                    asyncio.set_event_loop(None)
+                    loop.close()
 
             thread = threading.Thread(
                 target=_run_loop,
@@ -203,8 +206,13 @@ class FiretitanSamplingClient(SamplingClient):
             return loop
 
     def _submit(self, coro) -> ConcurrentFuture[Any]:
-        loop = self._ensure_loop()
-        return asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            with self._loop_lock:
+                loop = self._ensure_loop()
+                return asyncio.run_coroutine_threadsafe(coro, loop)
+        except BaseException:
+            coro.close()
+            raise
 
     @staticmethod
     async def _await_concurrent_future(future: ConcurrentFuture[Any]) -> Any:
@@ -480,35 +488,73 @@ class FiretitanSamplingClient(SamplingClient):
             await async_client.aclose()
         self.deployment_sampler._sync_client.close()
 
+    async def _shutdown_loop(self) -> None:
+        current_task = asyncio.current_task()
+        pending = {task for task in asyncio.all_tasks() if task is not current_task}
+        for task in pending:
+            task.cancel()
+        phase_timeout = SAMPLER_SHUTDOWN_TIMEOUT_S / 2
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=phase_timeout)
+
+        try:
+            await self._aclose_sampler()
+        except Exception:
+            logger.debug("Failed to close FiretitanSamplingClient cleanly", exc_info=True)
+        finally:
+            if pending:
+                _, pending = await asyncio.wait(pending, timeout=phase_timeout)
+            if pending:
+                logger.debug(
+                    "Stopped FiretitanSamplingClient with %d sampling tasks still pending",
+                    len(pending),
+                )
+            asyncio.get_running_loop().call_soon(asyncio.get_running_loop().stop)
+
     def close(self) -> None:
         """Close the wrapper loop and the underlying sampler clients."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._loop_lock:
+            if self._closed:
+                return
+            self._closed = True
+            loop = self._loop
+            thread = self._loop_thread
+            self._loop = None
+            self._loop_thread = None
 
-        loop = self._loop
-        thread = self._loop_thread
         if loop is not None and loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(self._aclose_sampler(), loop)
+            shutdown_coro = self._shutdown_loop()
+            if thread is threading.current_thread():
+                try:
+                    loop.create_task(shutdown_coro)
+                except BaseException:
+                    shutdown_coro.close()
+                    raise
+                return
+
             try:
-                future.result(timeout=SAMPLER_SHUTDOWN_TIMEOUT_S)
+                future = asyncio.run_coroutine_threadsafe(shutdown_coro, loop)
+            except BaseException:
+                shutdown_coro.close()
+                raise
+
+            try:
+                future.result(timeout=2 * SAMPLER_SHUTDOWN_TIMEOUT_S)
             except Exception:
                 logger.debug("Failed to close FiretitanSamplingClient cleanly", exc_info=True)
-            loop.call_soon_threadsafe(loop.stop)
-            if thread is not None and thread is not threading.current_thread():
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
+            if thread is not None:
                 thread.join(timeout=SAMPLER_SHUTDOWN_TIMEOUT_S)
-            if thread is None or not thread.is_alive():
-                loop.close()
-            else:
+            if thread.is_alive():
                 logger.debug(
                     "Skipped closing FiretitanSamplingClient loop because the loop thread "
                     "did not stop before the close timeout"
                 )
         else:
             self.deployment_sampler.close()
-
-        self._loop = None
-        self._loop_thread = None
 
     def __enter__(self) -> "FiretitanSamplingClient":
         return self
