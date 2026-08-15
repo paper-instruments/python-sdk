@@ -1776,7 +1776,7 @@ class TestFiretitanSamplingClient:
         finally:
             client.close()
 
-    def test_close_drains_cancelled_native_sampling_before_stopping_loop(self):
+    def test_close_cancels_and_drains_native_sampling_before_stopping_loop(self):
         class _TrackingController:
             def __init__(self):
                 self.acquire_count = 0
@@ -1814,10 +1814,9 @@ class TestFiretitanSamplingClient:
         async def _run():
             task = asyncio.create_task(client.sample_with_prompt_tokens([1]))
             assert await asyncio.to_thread(stream_started.wait, 2)
-            task.cancel()
             client.close()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await asyncio.wait_for(task, 2)
 
         try:
             asyncio.run(_run())
