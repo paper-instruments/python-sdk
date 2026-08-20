@@ -6,6 +6,8 @@ import sys
 import types as pytypes
 import asyncio
 import logging
+import threading
+from contextvars import ContextVar
 from dataclasses import replace
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock
@@ -26,6 +28,7 @@ from fireworks.training.sdk.deployment import (
     DeploymentConfig,
     DeploymentManager,
     DeploymentSampler,
+    SampledCompletion,
     FixedConcurrencyController,
     AdaptiveConcurrencyController,
     DeploymentSamplerTimeoutError,
@@ -1673,6 +1676,207 @@ class TestFiretitanSamplingClient:
         finally:
             client.close()
 
+    def test_native_sampling_runs_on_managed_loop_without_conversion(self):
+        sampler = _make_sampler(tokenizer=None)
+        completion = SampledCompletion(
+            text="done",
+            full_tokens=[10, 20, 30],
+            prompt_len=2,
+            completion_len=1,
+        )
+        marker = object()
+        request_context = ContextVar("request_context")
+        request_context.set(marker)
+        captured = {}
+
+        async def _sample(*args, **kwargs):
+            captured["thread_name"] = threading.current_thread().name
+            captured["loop"] = asyncio.get_running_loop()
+            captured["context"] = request_context.get()
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return [completion]
+
+        sampler.sample_with_prompt_tokens = _sample
+        client = FiretitanSamplingClient(sampler)
+
+        async def _run():
+            return await client.sample_with_prompt_tokens(
+                [10, 20],
+                n=3,
+                max_tokens=512,
+                temperature=0.7,
+                max_seq_len=4096,
+                stop=[99],
+                logprobs=True,
+                request_marker=marker,
+            )
+
+        try:
+            result = asyncio.run(_run())
+            assert captured["thread_name"] == "fireworks-sampling-client"
+            assert captured["loop"] is client._loop
+            assert captured["context"] is marker
+            assert captured["args"] == ([10, 20],)
+            assert captured["kwargs"] == {
+                "n": 3,
+                "max_tokens": 512,
+                "temperature": 0.7,
+                "max_seq_len": 4096,
+                "stop": [99],
+                "logprobs": True,
+                "request_marker": marker,
+            }
+            assert result == [completion]
+            assert result[0] is completion
+        finally:
+            client.close()
+
+    def test_native_sampling_cancellation_preserves_client_reuse(self):
+        sampler = _make_sampler(tokenizer=None)
+        started = threading.Event()
+        cancelled = threading.Event()
+        completion = SampledCompletion(
+            text="done",
+            full_tokens=[1, 2],
+            prompt_len=1,
+            completion_len=1,
+        )
+        calls = 0
+
+        async def _sample(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            return [completion]
+
+        sampler.sample_with_prompt_tokens = _sample
+        client = FiretitanSamplingClient(sampler)
+
+        async def _run():
+            task = asyncio.create_task(client.sample_with_prompt_tokens([1]))
+            assert await asyncio.to_thread(started.wait, 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert await asyncio.to_thread(cancelled.wait, 2)
+
+            result = await client.sample_with_prompt_tokens([1])
+            assert result[0] is completion
+
+        try:
+            asyncio.run(_run())
+            assert calls == 2
+        finally:
+            client.close()
+
+    def test_close_cancels_and_drains_native_sampling_before_stopping_loop(self):
+        class _TrackingController:
+            def __init__(self):
+                self.acquire_count = 0
+                self.release_count = 0
+
+            @property
+            def window_size(self):
+                return 1
+
+            async def acquire(self):
+                self.acquire_count += 1
+
+            def release(self, _metrics=None):
+                self.release_count += 1
+
+            def step_completed(self):
+                return {}
+
+        controller = _TrackingController()
+        sampler = _make_sampler(tokenizer=None, concurrency_controller=controller)
+        stream_started = threading.Event()
+        stream_finalized = threading.Event()
+
+        async def _sample_stream(*_args, **_kwargs):
+            stream_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0)
+                stream_finalized.set()
+
+        sampler.async_completions_stream = _sample_stream
+        client = FiretitanSamplingClient(sampler)
+
+        async def _run():
+            task = asyncio.create_task(client.sample_with_prompt_tokens([1]))
+            assert await asyncio.to_thread(stream_started.wait, 2)
+            client.close()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+
+        try:
+            asyncio.run(_run())
+        finally:
+            client.close()
+
+        assert stream_finalized.is_set()
+        assert controller.acquire_count == 1
+        assert controller.release_count == 1
+
+    def test_close_closes_transport_when_sampling_delays_cancellation(self, monkeypatch):
+        monkeypatch.setattr("fireworks.training.sdk.client.SAMPLER_SHUTDOWN_TIMEOUT_S", 0.1)
+        sampler = _make_sampler(tokenizer=None)
+        transport_closed = threading.Event()
+        stream_started = threading.Event()
+
+        class _AsyncClient:
+            is_closed = False
+
+            async def aclose(self):
+                self.is_closed = True
+                transport_closed.set()
+
+        async_client = _AsyncClient()
+        sampler._async_client = async_client
+        sync_client = sampler._sync_client
+
+        async def _sample_stream(*_args, **_kwargs):
+            stream_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                while not transport_closed.is_set():
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError:
+                        pass
+                raise
+
+        sampler.async_completions_stream = _sample_stream
+        client = FiretitanSamplingClient(sampler)
+
+        async def _run():
+            task = asyncio.create_task(client.sample_with_prompt_tokens([1]))
+            assert await asyncio.to_thread(stream_started.wait, 2)
+            thread = client._loop_thread
+            assert thread is not None
+            task.cancel()
+            client.close()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return thread
+
+        thread = asyncio.run(_run())
+
+        assert transport_closed.is_set()
+        assert async_client.is_closed
+        assert sync_client.is_closed
+        assert not thread.is_alive()
+
     def test_sample_returns_tinker_response(self, fake_tinker):
         prompt_ids = [10, 20, 30]
         completion_ids = [40, 50]
@@ -1882,21 +2086,75 @@ class TestFiretitanSamplingClient:
         finally:
             client.close()
 
+    def test_submit_closes_coroutine_when_client_is_closed(self):
+        sampler = _make_sampler(tokenizer=None)
+        client = FiretitanSamplingClient(sampler)
+        client.close()
+
+        async def _unused():
+            return None
+
+        coro = _unused()
+        with pytest.raises(RuntimeError, match="is closed"):
+            client._submit(coro)
+
+        assert coro.cr_frame is None
+
+    def test_submit_closes_coroutine_when_scheduling_fails(self, monkeypatch):
+        sampler = _make_sampler(tokenizer=None)
+        client = FiretitanSamplingClient(sampler)
+
+        async def _unused():
+            return None
+
+        def _fail_scheduling(_coro, _loop):
+            raise RuntimeError("scheduling failed")
+
+        coro = _unused()
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio, "run_coroutine_threadsafe", _fail_scheduling)
+                with pytest.raises(RuntimeError, match="scheduling failed"):
+                    client._submit(coro)
+
+            assert coro.cr_frame is None
+        finally:
+            client.close()
+
+    def test_close_from_owned_loop_is_nonblocking_and_loop_closes(self, monkeypatch):
+        monkeypatch.setattr("fireworks.training.sdk.client.SAMPLER_SHUTDOWN_TIMEOUT_S", 0.1)
+        sampler = _make_sampler(tokenizer=None)
+        client = FiretitanSamplingClient(sampler)
+        loop = client._ensure_loop()
+        thread = client._loop_thread
+        assert thread is not None
+
+        async def _close_from_owned_loop():
+            client.close()
+
+        future = client._submit(_close_from_owned_loop())
+        future.result(timeout=2)
+        thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert loop.is_closed()
+
     def test_close_does_not_close_loop_if_thread_join_times_out(self, monkeypatch):
         sampler = _make_sampler(tokenizer=None)
         client = FiretitanSamplingClient(sampler)
 
         class _FakeLoop:
             closed = False
+            stopped = False
 
             def is_running(self):
                 return True
 
             def call_soon_threadsafe(self, callback, *args):
-                return None
+                callback(*args)
 
             def stop(self):
-                return None
+                self.stopped = True
 
             def close(self):
                 self.closed = True
@@ -1928,6 +2186,7 @@ class TestFiretitanSamplingClient:
         client.close()
 
         assert fake_thread.joined is True
+        assert fake_loop.stopped is True
         assert fake_loop.closed is False
 
 
