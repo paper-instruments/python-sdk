@@ -47,9 +47,8 @@ Repository = "https://github.com/fw-ai-external/python-sdk"
 # Use this for CI, deployment, and programmatic training job management.
 training-sdk = [
   "tinker==0.23.0 ; python_version >= '3.11'",
-  # Tinker 0.23 constructs pyqwest.HTTPTransport() without opting into system
-  # TLS roots. pyqwest 0.7 changed that constructor default, breaking HTTPS.
-  "pyqwest==0.6.2 ; python_version >= '3.11'",
+  # The TLS compatibility patch enables system roots explicitly for this version.
+  "pyqwest==0.9.0 ; python_version >= '3.11'",
   "requests",
   "urllib3>=1.26,<3",
 ]

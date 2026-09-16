@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import asyncio
+from types import SimpleNamespace
 from typing import Any, cast
 from contextlib import contextmanager
 from collections.abc import Generator, AsyncIterator
@@ -55,7 +56,7 @@ class _PyqwestResponse:
         self.status = 200
         self.headers = {"content-type": content_type}
         self.trailers: dict[str, str] = {}
-        self.content = body
+        self.content = body.__aiter__()
         self.closed = asyncio.Event()
 
     async def aclose(self) -> None:
@@ -156,6 +157,30 @@ def test_patch_is_installed_by_sdk_import() -> None:
         "_fireworks_body_timeout_patch",
         False,
     )
+
+
+def test_stalled_headers_return_retryable_transport_error() -> None:
+    async def run() -> None:
+        transport = _DelayedTransport(header_delay=10, body_delay=0)
+        client, http_client = _client_for_transport(transport)
+        fetch = _tinker_future_body_timeout_patch._make_fetch_via_rest(
+            header_timeout_seconds=0.05,
+            body_timeout_seconds=0.1,
+        )
+        try:
+            result = await fetch(
+                _make_future(_Holder(client), "future-stalled-headers"),
+                SimpleNamespace(allow_metadata_only=False),
+                0,
+            )
+        finally:
+            await http_client.aclose()
+
+        assert isinstance(result, api_future_impl._TransportError)
+        assert result.kind is api_future_impl._TransportErrorKind.RETRY_WITH_BACKOFF
+        assert len(transport.requests) == 1
+
+    asyncio.run(run())
 
 
 def test_stalled_body_closes_and_repolls_the_same_future(monkeypatch: Any) -> None:

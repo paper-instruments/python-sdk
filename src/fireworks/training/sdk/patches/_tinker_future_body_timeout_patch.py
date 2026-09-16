@@ -1,8 +1,8 @@
 """Bound Tinker future response-body reads for Fireworks training clients.
 
-Tinker 0.23.0 passes a 45-second timeout to pyqwest, but pyqwest stops that
-timer when response headers arrive. A stalled result body can therefore keep
-``APIFuture`` blocked until an infrastructure timeout closes the connection.
+Tinker 0.23.0 relies on the transport's response timeout. Older pyqwest
+releases stopped it at response headers; newer releases apply it to the body
+as well. Enforce the same independent deadlines with either transport.
 
 This downstream compatibility patch reads the complete retrieve response with
 separate header and body deadlines. Body timeout and transport failures enter
@@ -44,15 +44,21 @@ def _make_fetch_via_rest(*, header_timeout_seconds: float, body_timeout_seconds:
         async def _retrieve_response():
             with self.holder.aclient(api_future_impl.ClientConnectionPoolType.RETRIEVE_PROMISE) as client:
                 retrieve_streaming = async_to_streamed_response_wrapper(client.futures.retrieve)
-                async with retrieve_streaming(
-                    request=api_future_impl.FutureRetrieveRequest(
-                        request_id=self.request_id,
-                        allow_metadata_only=state.allow_metadata_only,
-                    ),
-                    timeout=header_timeout_seconds,
-                    extra_headers=headers,
-                    max_retries=0,
-                ) as response:
+                async with contextlib.AsyncExitStack() as stack:
+                    response = await asyncio.wait_for(
+                        stack.enter_async_context(
+                            retrieve_streaming(
+                                request=api_future_impl.FutureRetrieveRequest(
+                                    request_id=self.request_id,
+                                    allow_metadata_only=state.allow_metadata_only,
+                                ),
+                                timeout=None,
+                                extra_headers=headers,
+                                max_retries=0,
+                            )
+                        ),
+                        timeout=header_timeout_seconds,
+                    )
                     body = await asyncio.wait_for(response.read(), timeout=body_timeout_seconds)
                     if "application/x-protobuf" in response.headers.get("content-type", ""):
                         return api_future_impl._SuccessProto(proto_bytes=body)
