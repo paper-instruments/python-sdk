@@ -165,6 +165,14 @@ mean_nll = result.metrics["loss:sum"] / max(result.metrics["response_tokens"], 1
 - Retry behavior mirrors Tinker-style exponential backoff for retryable HTTP/network errors.
 - HTTP 425 (deployment hotloading) is intentionally handled at call sites with longer polling intervals.
 
+With the default Tinker timeout, `forward_backward` submission allows 120 seconds
+for upload and acknowledgement, retaining the 5-second connect timeout and existing
+retry policy. The pinned pyqwest 0.9 transport uses one combined deadline; this
+matches the 60 + 60 second budget from [upstream's correction](https://github.com/curioswitch/pyqwest/pull/220)
+without changing the shared transport dependency. Custom client timeouts are preserved.
+The subsequent training-result wait has its own timeout. This is tolerance for slow
+submissions, not recovery from lost trainer state.
+
 ## Next step
 
 Use this layer directly when building your own algorithm loop, or use the

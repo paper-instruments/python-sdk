@@ -35,6 +35,7 @@ import httpx
 from tinker import SamplingClient, types
 from pydantic import BaseModel
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from tinker._constants import DEFAULT_TIMEOUT
 from tinker.lib.telemetry import Telemetry
 from tinker.lib.api_future_impl import _APIFuture, _CombinedAPIFuture
 from tinker.lib.queue_state_logger import QueueStateLogger
@@ -1694,7 +1695,12 @@ class FiretitanTrainingClient(TrainingClient):
             seq_id=request_id + 1,
         )
         with self.holder.aclient(ClientConnectionPoolType.TRAIN) as client:
-            return await client.training.forward_backward(request=request)
+            timeout = client.timeout
+            if timeout == DEFAULT_TIMEOUT:
+                # pyqwest 0.9 shares one deadline across the upload and acknowledgement.
+                # Match the 60s + 60s operation budget in pyqwest PR #220 without upgrading E2B's transport.
+                timeout = httpx.Timeout(120, connect=timeout.connect, pool=timeout.pool)
+            return await client.training.forward_backward(request=request, timeout=timeout)
 
     def optim_step(
         self,

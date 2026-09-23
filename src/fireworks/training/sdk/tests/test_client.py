@@ -15,6 +15,8 @@ import httpx
 import torch
 import pytest
 from tinker import types
+from tinker._client import AsyncTinker
+from tinker._constants import DEFAULT_TIMEOUT
 
 from fireworks.training.sdk.client import (
     FIRETITAN_TINKER_CLIENT_CONFIG,
@@ -535,13 +537,82 @@ class TestRoutingMatrixChunkSizing:
         assert [len(chunk) for chunk in chunks] == [1, 1]
 
 
+@pytest.mark.parametrize(
+    "configured_timeout, expected_timeout",
+    [
+        (DEFAULT_TIMEOUT, httpx.Timeout(120, connect=5, pool=60)),
+        (httpx.Timeout(30, connect=3), httpx.Timeout(30, connect=3)),
+        (httpx.Timeout(300, connect=5), httpx.Timeout(300, connect=5)),
+        (httpx.Timeout(None), httpx.Timeout(None)),
+    ],
+)
+async def test_forward_backward_upload_timeout_preserves_payload_and_retry_identity(
+    configured_timeout, expected_timeout, monkeypatch
+):
+    requests: list[httpx.Request] = []
+
+    async def respond(request):
+        requests.append(request)
+        if len(requests) == 1:
+            raise httpx.ReadTimeout("delayed acknowledgement", request=request)
+        return httpx.Response(200, json={"request_id": "ack"})
+
+    datum = types.Datum(
+        model_input=types.ModelInput.from_ints([10, 20]).model_copy(update={"routing_matrices": ["", "AQID"]}),
+        loss_fn_inputs={
+            "target_tokens": types.TensorData(data=[20, 30], dtype="int64", shape=[2]),
+            "logprobs": types.TensorData(data=[0.0, -0.5], dtype="float32", shape=[2]),
+            "advantages": types.TensorData(data=[0.0, 0.25], dtype="float32", shape=[2]),
+        },
+    )
+    loss_config = {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0}
+    async with AsyncTinker(
+        api_key="tml-test",
+        base_url="http://localhost",
+        timeout=configured_timeout,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+        _strict_response_validation=True,
+    ) as rest:
+        monkeypatch.setattr(rest, "_calculate_retry_timeout", lambda *_args, **_kwargs: 0)
+        client = _bare_training_client()
+        client.model_id = "model"
+        client.holder = MagicMock()
+        client.holder.aclient.return_value.__enter__.return_value = rest
+
+        result = await client._send_single_forward_backward_request(41, [datum], "cispo", loss_config)
+
+        assert result.request_id == "ack"
+        assert rest.timeout == configured_timeout
+        assert rest.max_retries == 10
+
+    assert len(requests) == 2
+    assert requests[0].content == requests[1].content
+    payload = json.loads(requests[0].content)
+    assert payload["model_id"] == "model"
+    assert payload["seq_id"] == 42
+    inputs = payload["forward_backward_input"]
+    assert inputs["loss_fn"] == "cispo"
+    assert inputs["loss_fn_config"] == loss_config
+    assert len(inputs["data"]) == 1
+    wire_datum = inputs["data"][0]
+    assert wire_datum["model_input"]["chunks"] == [{"type": "encoded_text", "tokens": [10, 20]}]
+    assert wire_datum["model_input"]["routing_matrices"] == ["", "AQID"]
+    assert wire_datum["loss_fn_inputs"] == {
+        name: {"data": tensor.data, "dtype": tensor.dtype, "shape": tensor.shape}
+        for name, tensor in datum.loss_fn_inputs.items()
+    }
+    assert requests[0].headers["X-Idempotency-Key"] == requests[1].headers["X-Idempotency-Key"]
+    assert [request.headers["X-Stainless-Retry-Count"] for request in requests] == ["0", "1"]
+    assert all(request.extensions["timeout"] == expected_timeout.as_dict() for request in requests)
+
+
 class TestParallelChunkSubmission:
     class _ClientContext:
         def __init__(self, training):
             self._training = training
 
         def __enter__(self):
-            return SimpleNamespace(training=self._training)
+            return SimpleNamespace(training=self._training, timeout=DEFAULT_TIMEOUT)
 
         def __exit__(self, exc_type, exc, tb):
             return False
@@ -606,7 +677,7 @@ class TestParallelChunkSubmission:
                 await asyncio.sleep(0)
                 return request.seq_id
 
-            async def forward_backward(self, *, request) -> int:
+            async def forward_backward(self, *, request, timeout=None) -> int:
                 send_order.append(request.seq_id)
                 await asyncio.sleep(0)
                 return request.seq_id
