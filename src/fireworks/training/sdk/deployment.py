@@ -771,7 +771,7 @@ class DeploymentManager(_RestClient):
         snapshot_identity: str,
         incremental_snapshot_metadata: dict[str, Any] | None = None,
         reset_prompt_cache: bool = True,
-        timeout: int = 600,
+        timeout: int = 200,
         path: str | None = None,
         cmek_resource: str | None = None,
     ) -> dict[str, Any]:
