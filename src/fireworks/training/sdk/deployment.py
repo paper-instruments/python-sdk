@@ -771,11 +771,14 @@ class DeploymentManager(_RestClient):
         snapshot_identity: str,
         incremental_snapshot_metadata: dict[str, Any] | None = None,
         reset_prompt_cache: bool = True,
-        timeout: int = 200,
+        timeout: int = 600,
         path: str | None = None,
         cmek_resource: str | None = None,
     ) -> dict[str, Any]:
         """Load a weight snapshot onto a deployment via the gateway.
+
+        Retryable POST failures have a 1200-second soft retry budget, separate
+        from readiness polling. An in-progress request can outlive that budget.
 
         Args:
             deployment_id: Target deployment ID.
@@ -835,6 +838,7 @@ class DeploymentManager(_RestClient):
             headers=headers,
             json=_payload(include_reset_prompt_cache),
             timeout=timeout,
+            max_wait_time=1200,
         )
         if not resp.is_success and include_reset_prompt_cache and self._reset_prompt_cache_unsupported(resp):
             logger.info("Hotload API rejected reset_prompt_cache; retrying without it")
@@ -845,6 +849,7 @@ class DeploymentManager(_RestClient):
                 headers=headers,
                 json=_payload(False),
                 timeout=timeout,
+                max_wait_time=1200,
             )
         elif resp.is_success and include_reset_prompt_cache:
             self._hotload_reset_prompt_cache_supported = True

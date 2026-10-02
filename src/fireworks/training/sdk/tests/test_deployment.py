@@ -22,6 +22,7 @@ from fireworks.training.sdk.client import (
     FiretitanSamplingParams,
     FiretitanSampledSequence,
 )
+from fireworks.training.sdk.errors import _backoff_delay
 from fireworks.training.sdk.deployment import (
     ServerMetrics,
     DeploymentInfo,
@@ -871,6 +872,66 @@ class TestHotload:
         mgr.hotload("dep-1", "accounts/test/models/m", "snap-123")
         call_kwargs = mgr._sync_request.call_args[1]
         assert call_kwargs["json"]["identity"] == "snap-123"
+
+    @pytest.mark.parametrize("fallback", [False, True])
+    @pytest.mark.parametrize("exhausted", [False, True])
+    def test_hotload_retries_long_timeout_without_changing_snapshot(
+        self, mgr, monkeypatch, fallback, exhausted,
+    ):
+        from fireworks.training.sdk import errors
+
+        # The suite fixture disables retries; this test exercises real backoff.
+        monkeypatch.setattr(errors, "_backoff_delay", _backoff_delay)
+        elapsed = 0.0
+        requests = []
+
+        def advance(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        monkeypatch.setattr(
+            errors, "time", pytypes.SimpleNamespace(time=lambda: elapsed, sleep=advance),
+        )
+
+        def respond(request):
+            requests.append(request)
+            if fallback and len(requests) == 1:
+                return httpx.Response(
+                    400,
+                    json={"error": {"message": "Extra inputs are not permitted, field: 'reset_prompt_cache'"}},
+                )
+            attempt = len(requests) - int(fallback)
+            if attempt == 1 or exhausted:
+                advance(600)
+                raise httpx.ReadTimeout("hotload timed out", request=request)
+            advance(400)
+            return httpx.Response(200, json={})
+
+        mgr._sync_client.close()
+        mgr._sync_client = httpx.Client(transport=httpx.MockTransport(respond))
+        mgr.wait_for_hotload = MagicMock(return_value=True)
+
+        if exhausted:
+            with pytest.raises(httpx.ReadTimeout):
+                mgr.hotload_and_wait("dep-1", "m", "snap-123", timeout_seconds=600)
+            mgr.wait_for_hotload.assert_not_called()
+            assert elapsed == 1201
+        else:
+            assert mgr.hotload_and_wait("dep-1", "m", "snap-123", timeout_seconds=600)
+            mgr.wait_for_hotload.assert_called_once_with(
+                deployment_id="dep-1", base_model="m",
+                expected_identity="snap-123", timeout_seconds=600,
+            )
+            assert elapsed == 1001
+
+        assert len(requests) == 2 + int(fallback)
+        assert requests[-1].content == requests[-2].content
+        assert requests[-1].headers == requests[-2].headers
+        for request in requests:
+            assert set(request.extensions["timeout"].values()) == {600}
+        if fallback:
+            assert b'"reset_prompt_cache"' in requests[0].content
+            assert b'"reset_prompt_cache"' not in requests[-1].content
 
     def test_hotload_headers_include_additional_headers(self, mgr):
         headers = mgr._hotload_headers("dep-1", "accounts/test/models/m")
